@@ -71,7 +71,7 @@ async function main() {
             console.log(`Depot ID: ${depot.ID}, Capacity: ${capacity}`);
             console.log(`Max Impact: ${result.maxImpact}`);
             console.log(`Selected Tasks:`, result.selectedTasks);
-            console.log('--------------------------------------------------');
+            
             
             await Log('backend', 'info', 'vehicle_maintence_scheduler', `Processed Depot ${depot.ID} with max impact ${result.maxImpact}`);
         }

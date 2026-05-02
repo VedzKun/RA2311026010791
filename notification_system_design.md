@@ -166,3 +166,91 @@ SELECT * FROM notifications
 WHERE notification_type = 'Placement' 
 AND created_at >= NOW() - INTERVAL '7 days'; 
 ```
+
+# Stage 4
+
+## Performance Improvement Strategy
+Currently, notifications are fetched on each page load. This synchronous polling overwhelms the database.
+
+**Suggested Solutions:**
+
+1. **Client-Side State Management + WebSockets (Push Model):**
+   Instead of fetching on every page load, the frontend fetches the initial state *once* upon login. As established in Stage 1, we use WebSockets. New notifications are pushed to the client in real-time. The frontend updates its local state globally (e.g., using Redux or Context API), eliminating the need for subsequent DB fetches during page navigation.
+2. **Read-Through Caching (Redis/Memcached):**
+   If we must rely on REST API fetches, we should cache the user's unread notifications in Redis. The DB is only queried upon a cache miss.
+
+## Tradeoffs
+- **WebSockets + Client State:**
+  - *Pros:* Massive reduction in server read load; instant real-time UX.
+  - *Cons:* High memory utilization on the server to keep WebSocket connections open; complex reconnection logic; potential missed messages on disconnects.
+- **Caching (Redis):**
+  - *Pros:* Extremely fast reads with minimal application code changes.
+  - *Cons:* Cache invalidation complexity (when to evict/update the cache as notifications are read); adds an extra infrastructure point of failure.
+
+# Stage 5
+
+## Shortcomings of the Pseudocode
+1. **Sequential Thread Blocking:** The loop operates synchronously. If the 3rd-party `send_email` API takes 1 second per email, sending 50,000 emails will take nearly 14 hours. 
+2. **Lack of Fault Tolerance (No Retries):** If `send_email` fails for 200 students (e.g., due to network timeout or rate limiting), the script might crash or skip them entirely. There is no mechanism to track and retry *only* the failed deliveries.
+3. **Tight Coupling:** The three functions (`email`, `db`, `push`) are tightly coupled. A failure in the email API shouldn't prevent saving the notification to the database or pushing it to the app.
+
+## Redesign for Reliability and Speed
+I would redesign this using an **Event-Driven Architecture** with **Message Queues** (e.g., Kafka, RabbitMQ, or AWS SQS).
+When the HR clicks "Notify All", the system simply publishes an asynchronous "Broadcast Event" and immediately returns a success response to the HR. Independent decoupled worker services consume this event.
+
+## Should saving to DB and sending email happen together?
+**No.** Saving to a DB is an internal, highly predictable, and fast operation (milliseconds). Sending an email relies on a 3rd party external API, which is slower and highly prone to timeouts, rate limits, and failures. Tying them together synchronously means the slow/unreliable system will negatively bottleneck the fast/reliable system.
+
+## Revised Pseudocode
+```python
+function notify_all(student_ids: array, message: string):
+    # Asynchronously publish the bulk action to a message broker (e.g., Kafka/RabbitMQ)
+    payload = { "student_ids": student_ids, "message": message }
+    message_broker.publish(topic="notifications.broadcast", data=payload)
+    return "Notification broadcast initiated"
+
+# --- Independent Background Workers consuming the topic ---
+
+# DB Worker
+function on_broadcast_save_db(payload):
+    # Batch inserts are much faster
+    batch_save_to_db(payload.student_ids, payload.message) 
+
+# Email Worker
+function on_broadcast_send_email(payload):
+    for student_id in payload.student_ids:
+        # Enqueue individual email tasks that support Retries and Dead Letter Queue (DLQ)
+        background_job_queue.enqueue(
+            task=send_email_task, 
+            args=(student_id, payload.message), 
+            retry_policy={ "max_retries": 3, "backoff": "exponential" }
+        )
+
+# Push Notification Worker
+function on_broadcast_push_app(payload):
+    for student_id in payload.student_ids:
+        background_job_queue.enqueue(task=push_to_app, args=(student_id, payload.message))
+```
+
+# Stage 6
+
+## Maintaining Top 10 High Priority Notifications Efficiently
+
+### Approach
+As new notifications arrive continuously, sorting the entire dataset $O(N \log N)$ every time becomes highly inefficient as $N$ grows. 
+
+To maintain the top $k$ (where $k=10$) notifications efficiently:
+
+1. **Priority Queue (Min-Heap):**
+   - We can maintain a Min-Heap of size $k$ for active unread notifications.
+   - A custom comparator is used: `Weight (Placement=3, Result=2, Event=1)` followed by `Recency`.
+   - When a new notification arrives:
+     - Compare it to the root of the Min-Heap (the lowest priority item in the top 10).
+     - If it's more important than the root, pop the root and push the new notification.
+   - **Time Complexity:** $O(\log k)$ per new notification instead of $O(N \log N)$. Space complexity is $O(k)$.
+
+2. **Redis Sorted Sets (Distributed Approach):**
+   - If deploying at scale in a microservices environment, use a Redis Sorted Set (ZSET) per user: `user:{id}:top_notifications`.
+   - The score inside the ZSET would be a composite float value combining `weight` and `timestamp`.
+   - New notifications are added via `ZADD`. We keep the set size capped at $k$ by triggering a `ZREMRANGEBYRANK` to remove elements extending beyond the standard size.
+   - Fetching the top 10 is an $O(1)$ operation `ZREVRANGE 0 9`.
